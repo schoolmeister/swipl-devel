@@ -124,8 +124,7 @@ identical for all attentive members of the quorum.|_
 
 :- meta_predicate
     paxos_on_change(?, 0),
-    paxos_on_change(?, ?, 0),
-    basic_paxos_on_change(+, ?, ?, 0).
+    paxos_on_change(?, ?, 0).
 
 :- multifile
     paxos_message_hook/3,               % +PaxOS, +TimeOut, -Message
@@ -171,36 +170,59 @@ paxos_initialize_sync :-
     !.
 paxos_initialize_sync :-
     listen(paxos, paxos(X), paxos_message(X)),
-    basic_paxos_on_change(paxos, Key, Value, paxos_audit(Key, Value)),
     node(_Node),
     asserta(paxos_initialized).
-%
-% The Paxos state machine is memoryless. The state is managed by a
-% coordinator.
-%
-paxos_audit(Key, Value) :-
-    (   paxos_get(Key, Value)
-    ->  true
-    ;   paxos_set(Key, Value)
-    ).
 
-paxos_message(prepare(Key,Node,K,Value)) :-
+
+%!  paxos_message(?Message)
+%
+%   Handle inbound actions from our peers.   Defines  values for Message
+%   are:
+%
+%     - prepare(+Key,-Node,-Gen,+Value)
+%     A request message to set Key to Value. Returns the current
+%     generation at which we have a value or `0` for Gen and the
+%     our node id for Node.
+%     - accept(+Key,-Node,+Gen,-GenA,+Value)
+%     A request message to set Key to Value if Gen is newer than
+%     the generation we have for Key.  In that case GenA is Gen.
+%     Otherwise we reject using GenA = `nack`.
+%     - changed(+Key,+Gen,+Value,+Acceptors)
+%     The leader got enough accepts for setting Key to Value at Gen.
+%     Acceptors is the set of nodes that accepted this value.
+%     - learn(+Key,+Gen,+Value,+Acceptors)
+%     The _replicator_ informs the _quorum_ and _learners_ about
+%     a value for which it thinks not all members have it.
+%     - retrieve(+Key,-Node,-Gen,-Value)
+%     A request message to retrieve our value for Key.  Also provides
+%     our node id and the generation.
+%
+%   @tbd: originally the changed was  handled  by   a  get  and when not
+%   successful with a new set, named   _paxos_audit_. I don't really see
+%   why we need this.
+
+paxos_message(prepare(Key,Node,Gen,Value)) :-
     node(Node),
-    (   ledger(Key, K, _)
+    (   ledger(Key, Gen, _)
     ->  true
-    ;   K = 0,
-        ledger_create(Key, K, Value)
+    ;   Gen = 0,
+        ledger_create(Key, Gen, Value)
     ),
-    debug(paxos, 'Prepared ~p-~p@~d', [Key,Value,K]).
-paxos_message(accept(Key,Node,K,KA,Value)) :-
+    debug(paxos, 'Prepared ~p-~p@~d', [Key,Value,Gen]).
+paxos_message(accept(Key,Node,Gen,GenA,Value)) :-
     node(Node),
-    debug(paxos, 'Accept ~p-~p@~p?', [Key, Value, K]),
-    (   ledger_update(Key, K, Value)
-    ->  debug(paxos, 'Accepted ~p-~p@~d', [Key,Value,K]),
-        KA = K
-    ;   debug(paxos, 'Rejected ~p@~d', [Key, K]),
-        KA = nack
+    debug(paxos, 'Accept ~p-~p@~p?', [Key, Value, Gen]),
+    (   ledger_update(Key, Gen, Value)
+    ->  debug(paxos, 'Accepted ~p-~p@~d', [Key,Value,Gen]),
+        GenA = Gen
+    ;   debug(paxos, 'Rejected ~p@~d', [Key, Gen]),
+        GenA = nack
     ).
+paxos_message(changed(Key,Gen,Value,Acceptors)) :-
+    ledger_update_holders(Key,Gen,Acceptors),
+    broadcast(paxos_changed(Key,Value)).
+paxos_message(learn(Key,Gen,Value,Acceptors)) :-
+    ledger_learn(Key,Gen,Value,Acceptors).
 paxos_message(retrieve(Key,Node,K,Value)) :-
     node(Node),
     debug(paxos, 'Retrieving ~p', [Key]),
@@ -271,7 +293,7 @@ paxos_set(Key, Value, Options) :-
       intersecting(PrepNodes, AcceptNodes),
       c_element(Ras, K, K1),
       broadcast(paxos(log(Key,Value,AcceptNodes,K1))),
-      paxos_message(changed(Key,Value), -, Changed),
+      paxos_message(changed(Key,K1,Value,AcceptNodes), -, Changed),
       broadcast(Changed),
     !.
 paxos_set(Key, Value, _) :-
@@ -451,16 +473,14 @@ paxos_on_change(Term, Goal) :-
 
 paxos_on_change(Key, Value, Goal) :-
     Goal = _:Plain,
+    must_be(callable, Plain),
     (   Plain == ignore
-    ->  unlisten(paxos_user, paxos(changed(Key,Value)))
-    ;   basic_paxos_on_change(paxos_user, Key, Value, Goal),
+    ->  unlisten(paxos_user, paxos_changed(Key,Value))
+    ;   listen(paxos_user, paxos(changed(Key,Value)),
+               thread_create(Goal, _, [detached(true)])),
         paxos_initialize
     ).
 
-basic_paxos_on_change(Owner, Key, Value, Goal) :-
-    must_be(callable, Goal),
-    listen(Owner, paxos(changed(Key,Value)),
-           thread_create(Goal, _, [detached(true)])).
 
 		 /*******************************
 		 *            HOOKS		*
@@ -499,28 +519,79 @@ paxos_message(Paxos, TMO, Message) :-
 		 *******************************/
 
 :- dynamic
-    paxons_ledger/3.
+    paxons_ledger/4.                    % Key, Gen, Value, Holders
 
 %!  ledger(+Key, -Gen, -Value) is semidet.
 %
-%   True if the ledger has Value associated with Key at generation Gen.
+%   True if the ledger has Value associated  with Key at generation Gen.
+%   Note that if the value is  not   yet  acknowledged  by the leader we
+%   should not use it.
 
 ledger(Key, Gen, Value) :-
-    paxons_ledger(Key, Gen, Value).
+    paxons_ledger(Key, Gen, Value0, Holders),
+    Holders \== 0,
+    !,
+    Value = Value0.
 
 %!  ledger_create(+Key, +Gen, +Value) is det.
 %
-%   Create a new Key-Value pair at generation Gen.
+%   Create a new Key-Value pair  at   generation  Gen.  This is executed
+%   during the preparation phase.
 
 ledger_create(Key, Gen, Value) :-
-    asserta(paxons_ledger(Key, Gen, Value)).
+    asserta(paxons_ledger(Key, Gen, Value, 0)).
 
 %!  ledger_update(+Key, +Gen, +Value) is semidet.
 %
-%   Update Key to Value if the current generation is older than Gen.
+%   Update Key to Value if the  current   generation  is older than Gen.
+%   This reflects the accept phase of the protocol.
 
 ledger_update(Key, Gen, Value) :-
-    clause(paxons_ledger(Key, Gen0, _Value), true, Ref),
+    paxons_ledger(Key, Gen0, _Value, _Holders),
+    !,
     Gen > Gen0,
-    asserta(paxons_ledger(Key, Gen, Value)),
-    erase(Ref).
+    asserta(paxons_ledger(Key, Gen, Value, 0)).
+
+%!  ledger_update_holders(+Key, +Gen, +Holders) is det.
+%
+%   The leader acknowledged that Key@Gen represents a valid new
+
+ledger_update_holders(Key, Gen, Holders) :-
+    clause(paxons_ledger(Key, Gen, Value, Holders0), true, Ref),
+    !,
+    asserta(paxons_ledger(Key, Gen, Value, Holders)),
+    erase(Ref),
+    clean_key(Holders0, Key, Gen).
+
+clean_key(0, Key, Gen) :-
+    !,
+    (   clause(paxons_ledger(Key, Gen0, _Value, _Holders0), true, Ref),
+        Gen0 < Gen,
+        erase(Ref),
+        fail
+    ;   true
+    ).
+clean_key(_, _, _).
+
+%!  ledger_learn(+Key,+Gen,+Value,+Acceptors) is det.
+%
+%   We received a learn event. Update  our   knowledge  for  Key. If our
+%   knowledge is more recent than the proposer's we try to get our value
+%   accepted.
+%
+%   @tbd Should we also consider the holders?
+
+ledger_learn(Key,Gen,Value,Acceptors) :-
+    retractall(paxons_ledger(Key, _Gen, _Value, 0)),
+    clause(paxons_ledger(Key, Gen0, Value0, _Holders), true, Ref),
+    !,
+    (   (   Gen > Gen0
+        ;   Value == Value0
+        )
+    ->  asserta(paxons_ledger(Key, Gen, Value, Acceptors)),
+        erase(Ref)
+    ;   paxos_set(Key, Value0)
+    ).
+
+ledger_learn(Key,Gen,Value,Acceptors) :-
+    asserta(paxons_ledger(Key, Gen, Value, Acceptors)).
