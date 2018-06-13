@@ -260,13 +260,13 @@ paxos_set(Key, Value, Options) :-
     paxos_message(prepare(Key,Np,Rp,Value), TMO, Prepare),
     between(0, Retries, _),
       quorum(Key, Quorum),
-      collect(Quorum, Np, Rp, Prepare, Rps, PrepNodes),
+      collect(Quorum, false, Np, Rp, Prepare, Rps, PrepNodes),
       majority(PrepNodes, Quorum),
       debug(paxos, 'Prepare: ~p', [Rps]),
       max_list(Rps, K),
       succ(K, K1),
       paxos_message(accept(Key,Na,K1,Ra,Value), TMO, Accept),
-      collect(Quorum, Na, Ra, Accept, Ras, AcceptNodes),
+      collect(Quorum, Ra == nack, Na, Ra, Accept, Ras, AcceptNodes),
       majority(AcceptNodes, Quorum),
       intersecting(PrepNodes, AcceptNodes),
       c_element(Ras, K, K1),
@@ -290,7 +290,8 @@ intersecting(Set1, Set2) :-
     Set1 /\ Set2 =\= 0.
 
 
-%!  collect(+Quorum, ?Node, ?Template, ?Message, -Result, -NodeSet)
+%!  collect(+Quorum, :Stop, ?Node, ?Template, ?Message,
+%!          -Result, -NodeSet) is semidet.
 %
 %   Perform a broadcast request using Message.   Node and Template share
 %   with Message and extract the replying node and the result value from
@@ -301,11 +302,16 @@ intersecting(Set1, Set2) :-
 %
 %   @tbd If we get a `nack` we can stop
 
-collect(Quorum, Node, Template, Message, Result, NodeSet) :-
+collect(Quorum, Stop, Node, Template, Message, Result, NodeSet) :-
     State = state(0),
     L0 = [dummy|_],
     Answers = list(L0),
     (   broadcast_request(Message),
+        (   Stop
+        ->  !,
+            fail
+        ;   true
+        ),
         duplicate_term(Template, Copy),
         NewLastCell = [Copy|_],
         arg(1, Answers, LastCell),
@@ -372,7 +378,7 @@ paxos_get(Key, Value, Options) :-
     between(0, Retries, _),
       quorum(Key, Quorum),
       QuorumA is Quorum /\ \(1<<Node),
-      collect(QuorumA, Nr, Msg, Retrieve, Terms, _0RetrievedNodes),
+      collect(QuorumA, false, Nr, Msg, Retrieve, Terms, _0RetrievedNodes),
       debug(paxos, 'Retrieved: ~p from 0x~16r', [Terms, _0RetrievedNodes]),
       highest_vote(Terms, _Line-MajorityValue, Count),
       debug(paxos, 'Best: ~p with ~d votes', [MajorityValue, Count]),
