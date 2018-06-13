@@ -128,7 +128,9 @@ identical for all attentive members of the quorum.|_
     basic_paxos_on_change(+, ?, ?, 0).
 
 :- multifile
-    paxos_message_hook/3.                       % +PaxOS, +TimeOut, -Message
+    paxos_message_hook/3,               % +PaxOS, +TimeOut, -Message
+    node/1,                             % NodeID
+    quorum/1.                           % Quorum bitmask
 
 :- setting(max_sets, nonneg, 20,
            "Max Retries to get to an agreement").
@@ -155,12 +157,23 @@ c_element(_List, Old, Old).
 %   a side-effect of initialize/0, which is now required as part of
 %   an applications initialization directive.
 
+:- dynamic  paxos_initialized/0.
+:- volatile paxos_initialized/0.
+
 paxos_initialize :-
-    listening(paxos, _, _),
+    paxos_initialized,
     !.
 paxos_initialize :-
+    with_mutex(paxos, paxos_initialize_sync).
+
+paxos_initialize_sync :-
+    paxos_initialized,
+    !.
+paxos_initialize_sync :-
     listen(paxos, paxos(X), paxos_message(X)),
-    basic_paxos_on_change(paxos, Key, Value, paxos_audit(Key, Value)).
+    basic_paxos_on_change(paxos, Key, Value, paxos_audit(Key, Value)),
+    node(_Node),
+    asserta(paxos_initialized).
 %
 % The Paxos state machine is memoryless. The state is managed by a
 % coordinator.
@@ -171,14 +184,16 @@ paxos_audit(Key, Value) :-
     ;   paxos_set(Key, Value)
     ).
 
-paxos_message(prepare(Key,K,Value)) :-
+paxos_message(prepare(Key,Node,K,Value)) :-
+    node(Node),
     (   ledger(Key, K, _)
     ->  true
     ;   K = 0,
         ledger_create(Key, K, Value)
     ),
     debug(paxos, 'Prepared ~p-~p@~d', [Key,Value,K]).
-paxos_message(accept(Key,K,KA,Value)) :-
+paxos_message(accept(Key,Node,K,KA,Value)) :-
+    node(Node),
     debug(paxos, 'Accept ~p-~p@~p?', [Key, Value, K]),
     (   ledger_update(Key, K, Value)
     ->  debug(paxos, 'Accepted ~p-~p@~d', [Key,Value,K]),
@@ -186,7 +201,8 @@ paxos_message(accept(Key,K,KA,Value)) :-
     ;   debug(paxos, 'Rejected ~p@~d', [Key, K]),
         KA = nack
     ).
-paxos_message(retrieve(Key,K,Value)) :-
+paxos_message(retrieve(Key,Node,K,Value)) :-
+    node(Node),
     debug(paxos, 'Retrieving ~p', [Key]),
     ledger(Key,K,Value),
     debug(paxos, 'Retrieved ~p-~p@~d', [Key,Value,K]),
@@ -241,16 +257,20 @@ paxos_set(Key, Value, Options) :-
     option(timeout(TMO), Options, TMO),
     apply_default(Retries, max_sets),
     apply_default(TMO, response_timeout),
-    paxos_message(prepare(Key,R,Value), TMO, Prepare),
+    paxos_message(prepare(Key,Np,Rp,Value), TMO, Prepare),
     between(0, Retries, _),
-      findall(R, broadcast_request(Prepare), Rs),
-      debug(paxos, 'Prepare: ~p', [Rs]),
-      max_list(Rs, K),
+      quorum(Key, Quorum),
+      collect(Quorum, Np, Rp, Prepare, Rps, PrepNodes),
+      majority(PrepNodes, Quorum),
+      debug(paxos, 'Prepare: ~p', [Rps]),
+      max_list(Rps, K),
       succ(K, K1),
-      paxos_message(accept(Key,K1,R,Value), TMO, Accept),
-      findall(R, broadcast_request(Accept), R1s),
-      c_element(R1s, K, K1),
-      broadcast(paxos(log(Key,Value,K1))),
+      paxos_message(accept(Key,Na,K1,Ra,Value), TMO, Accept),
+      collect(Quorum, Na, Ra, Accept, Ras, AcceptNodes),
+      majority(AcceptNodes, Quorum),
+      intersecting(PrepNodes, AcceptNodes),
+      c_element(Ras, K, K1),
+      broadcast(paxos(log(Key,Value,AcceptNodes,K1))),
       paxos_message(changed(Key,Value), -, Changed),
       broadcast(Changed),
     !.
@@ -262,6 +282,45 @@ apply_default(Var, Setting) :-
     !,
     setting(Setting, Var).
 apply_default(_, _).
+
+majority(SubSet, Set) :-
+    popcount(SubSet) >= (popcount(Set)+2)//2.
+
+intersecting(Set1, Set2) :-
+    Set1 /\ Set2 =\= 0.
+
+
+%!  collect(+Quorum, ?Node, ?Template, ?Message, -Result, -NodeSet)
+%
+%   Perform a broadcast request using Message.   Node and Template share
+%   with Message and extract the replying node and the result value from
+%   Message. Result is the list of  instantiations for Template received
+%   and NodeSet is the set (bitmask) of   Node values that replies, i.e.
+%   |NodeSet| is length(Result). The transfer stops   if  all members of
+%   the set Quorum responded or the configured timeout passed.
+%
+%   @tbd If we get a `nack` we can stop
+
+collect(Quorum, Node, Template, Message, Result, NodeSet) :-
+    State = state(0),
+    L0 = [dummy|_],
+    Answers = list(L0),
+    (   broadcast_request(Message),
+        duplicate_term(Template, Copy),
+        NewLastCell = [Copy|_],
+        arg(1, Answers, LastCell),
+        nb_linkarg(2, LastCell, NewLastCell),
+        nb_linkarg(1, Answers, NewLastCell),
+        arg(1, State, Replied0),
+        Replied is Replied0 \/ (1<<Node),
+        nb_setarg(1, State, Replied),
+        Quorum /\ Replied =:= Quorum
+    ->  true
+    ;   true
+    ),
+    arg(1, State, NodeSet),
+    arg(1, Answers, [_]),               % close the answer list
+    L0 = [_|Result].
 
 %!  paxos_get(?Term) is semidet.
 %
@@ -308,12 +367,36 @@ paxos_get(Key, Value, Options) :-
     apply_default(Retries, max_gets),
     apply_default(TMO, response_timeout),
     Msg = Line-Value,
-    paxos_message(retrieve(Key,Line,Value), TMO, Retrieve),
+    paxos_message(retrieve(Key,Nr,Line,Value), TMO, Retrieve),
+    node(Node),
     between(0, Retries, _),
-    findall(Msg, broadcast_request(Retrieve), Terms),
-    c_element(Terms, no, Msg),
-    paxos_set(Key, Value),
+      quorum(Key, Quorum),
+      QuorumA is Quorum /\ \(1<<Node),
+      collect(QuorumA, Nr, Msg, Retrieve, Terms, _0RetrievedNodes),
+      debug(paxos, 'Retrieved: ~p from 0x~16r', [Terms, _0RetrievedNodes]),
+      highest_vote(Terms, _Line-MajorityValue, Count),
+      debug(paxos, 'Best: ~p with ~d votes', [MajorityValue, Count]),
+      Count >= (popcount(QuorumA)+2)//2,
+      debug(paxos, 'Retrieve: accept ~p', [MajorityValue]),
+      paxos_set(Key, MajorityValue),    % Is this needed?
     !.
+
+highest_vote(Terms, Term, Count) :-
+    msort(Terms, Sorted),
+    count_votes(Sorted, Counted),
+    sort(1, >, Counted, [Count-Term|_]).
+
+count_votes([], []).
+count_votes([H|T0], [N-H|T]) :-
+    count_same(H, T0, 1, N, R),
+    count_votes(R, T).
+
+count_same(H, [Hc|T0], C0, C, R) :-
+    H == Hc,
+    !,
+    C1 is C0+1,
+    count_same(H, T0, C1, C, R).
+count_same(_, R, C, C, R).
 
 %!  paxos_key(+Term, -Key) is det.
 %
@@ -364,18 +447,30 @@ paxos_on_change(Key, Value, Goal) :-
     Goal = _:Plain,
     (   Plain == ignore
     ->  unlisten(paxos_user, paxos(changed(Key,Value)))
-    ;   basic_paxos_on_change(paxos_user, Key, Value, Goal)
+    ;   basic_paxos_on_change(paxos_user, Key, Value, Goal),
+        paxos_initialize
     ).
 
 basic_paxos_on_change(Owner, Key, Value, Goal) :-
     must_be(callable, Goal),
-    paxos_initialize,
     listen(Owner, paxos(changed(Key,Value)),
            thread_create(Goal, _, [detached(true)])).
 
 		 /*******************************
-		 *    HOOK BROADCAST MESSAGES	*
+		 *            HOOKS		*
 		 *******************************/
+
+%!  node(-Node) is det.
+%
+%   Get the node ID for this paxos node.
+
+%!  quorum(-Quorum) is det.
+%
+%   Get the current quorum as a bitmask
+
+quorum(_Key, Quorum) :-
+    quorum(Quorum).
+
 
 %!  paxos_message(+PaxOS, +TimeOut, -BroadcastMessage) is det.
 %
@@ -394,7 +489,7 @@ paxos_message(Paxos, TMO, Message) :-
 
 
 		 /*******************************
-		 *         HOOK STORAGE		*
+		 *           STORAGE		*
 		 *******************************/
 
 :- dynamic
