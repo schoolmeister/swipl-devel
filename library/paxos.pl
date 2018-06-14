@@ -40,7 +40,6 @@
             paxos_set/1,         % ?Term
             paxos_set/2,         % +Key, +Value
             paxos_set/3,         % +Key, +Value, +Options
-            paxos_replicate/1,   % ?Term
             paxos_on_change/2,   % ?Term, +Goal
             paxos_on_change/3    % ?Key, ?Value, +Goal
           ]).
@@ -437,17 +436,6 @@ paxos_key(Compound, '$c'(Name,Arity)) :-
 paxos_key(Compound, _) :-
     must_be(compound, Compound).
 
-
-%!  paxos_replicate(?Term) is det.
-%
-%   declares that Term is to be   automatically replicated to the quorum
-%   each time it becomes grounded.  It   uses  the  behavior afforded by
-%   when/2.
-%
-%   @arg Term is an ungrounded Term
-
-paxos_replicate(X) :-
-    when(ground(X), paxos_set(X)).
 
 %!  paxos_on_change(?Term, :Goal) is det.
 %!  paxos_on_change(?Key, ?Value, :Goal) is det.
