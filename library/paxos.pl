@@ -41,7 +41,9 @@
             paxos_set/2,         % +Key, +Value
             paxos_set/3,         % +Key, +Value, +Options
             paxos_on_change/2,   % ?Term, +Goal
-            paxos_on_change/3    % ?Key, ?Value, +Goal
+            paxos_on_change/3,   % ?Key, ?Value, +Goal
+                                 % Hook support
+            paxos_replicate/2    % +Nodes, +Options
           ]).
 :- use_module(library(broadcast)).
 :- use_module(library(debug)).
@@ -49,7 +51,6 @@
 :- use_module(library(settings)).
 :- use_module(library(option)).
 :- use_module(library(error)).
-:- use_module(library(when)).
 
 /** <module> A Replicated Data Store
 
@@ -189,9 +190,11 @@ paxos_initialize_sync :-
 %     - changed(+Key,+Gen,+Value,+Acceptors)
 %     The leader got enough accepts for setting Key to Value at Gen.
 %     Acceptors is the set of nodes that accepted this value.
-%     - learn(+Key,+Gen,+Value,+Acceptors)
-%     The _replicator_ informs the _quorum_ and _learners_ about
-%     a value for which it thinks not all members have it.
+%     - learn(+Key,-Node,+Gen,-GenA,+Value)
+%     Request message peforming phase one for replication to learner
+%     nodes.
+%     - learned(+Key,+Gen,+Value,+Acceptors)
+%     Phase two of the replication. Confirm the newly learned knowledge.
 %     - retrieve(+Key,-Node,-Gen,-Value)
 %     A request message to retrieve our value for Key.  Also provides
 %     our node id and the generation.
@@ -220,8 +223,17 @@ paxos_message(accept(Key,Node,Gen,GenA,Value)) :-
 paxos_message(changed(Key,Gen,Value,Acceptors)) :-
     ledger_update_holders(Key,Gen,Acceptors),
     broadcast(paxos_changed(Key,Value)).
-paxos_message(learn(Key,Gen,Value,Acceptors)) :-
-    ledger_learn(Key,Gen,Value,Acceptors).
+paxos_message(learn(Key,Node,Gen,GenA,Value)) :-
+    node(Node),
+    debug(paxos, 'Learn ~p-~p@~p?', [Key, Value, Gen]),
+    (   ledger_learn(Key,Gen,Value)
+    ->  debug(paxos, 'Learned ~p-~p@~d', [Key,Value,Gen]),
+        GenA = Gen
+    ;   debug(paxos, 'Rejected ~p@~d', [Key, Gen]),
+        GenA = nack
+    ).
+paxos_message(learned(Key,Gen,_Value,Acceptors)) :-
+    ledger_update_holders(Key,Gen,Acceptors).
 paxos_message(retrieve(Key,Node,K,Value)) :-
     node(Node),
     debug(paxos, 'Retrieving ~p', [Key]),
@@ -436,6 +448,37 @@ paxos_key(Compound, '$c'(Name,Arity)) :-
 paxos_key(Compound, _) :-
     must_be(compound, Compound).
 
+%!  paxos_replicate(+Nodes, +Options) is det.
+%
+%   Start a replication process, ensuring that  Nodes have an up-to-date
+%   value for all keys.  Options:
+%
+%     - new(+Bool)
+%     If `true` (default), only send keys we think are not already
+%     known to the Nodes.  Otherwise, send all keys.
+%     - timeout(+Seconds)
+%     Max time to wait for the forum to reply.  Defaults to the
+%     _setting_ `response_timeout` (0.020, 20ms).
+
+paxos_replicate(Nodes, Options) :-
+    option(new(New), Options, true),
+    !,
+    option(timeout(TMO), Options, TMO),
+    apply_default(TMO, response_timeout),
+    bitmap_list(Bitmap, Nodes),
+    (   ledger_current(Key, Gen, Value, Holders),
+        (   New == false
+        ->  true
+        ;   Bitmap /\ \Holders =\= 0
+        ),
+        paxos_message(learn(Key,Na,Gen,Ga,Value), TMO, Learn),
+        collect(Bitmap, Ga == nack, Na, Ga, Learn, _Gas, LearnedNodes),
+        NewHolders is Holders \/ LearnedNodes,
+        paxos_message(learned(Key,Gen,Value,NewHolders), -, Learned),
+        broadcast(Learned),
+        fail
+    ;   true
+    ).
 
 %!  paxos_on_change(?Term, :Goal) is det.
 %!  paxos_on_change(?Key, ?Value, :Goal) is det.
@@ -507,6 +550,15 @@ paxos_message(Paxos, TMO, Message) :-
 :- dynamic
     paxons_ledger/4.                    % Key, Gen, Value, Holders
 
+%!  ledger_current(?Key, ?Gen, ?Value, ?Holders) is nondet.
+%
+%   True when Key is a known key in my ledger.
+
+ledger_current(Key, Gen, Value, Holders) :-
+    paxons_ledger(Key, Gen, Value, Holders),
+    Holders \== 0.
+
+
 %!  ledger(+Key, -Gen, -Value) is semidet.
 %
 %   True if the ledger has Value associated  with Key at generation Gen.
@@ -545,8 +597,11 @@ ledger_update(Key, Gen, Value) :-
 ledger_update_holders(Key, Gen, Holders) :-
     clause(paxons_ledger(Key, Gen, Value, Holders0), true, Ref),
     !,
-    asserta(paxons_ledger(Key, Gen, Value, Holders)),
-    erase(Ref),
+    (   Holders0 == Holders
+    ->  true
+    ;   asserta(paxons_ledger(Key, Gen, Value, Holders)),
+        erase(Ref)
+    ),
     clean_key(Holders0, Key, Gen).
 
 clean_key(0, Key, Gen) :-
@@ -559,25 +614,46 @@ clean_key(0, Key, Gen) :-
     ).
 clean_key(_, _, _).
 
-%!  ledger_learn(+Key,+Gen,+Value,+Acceptors) is det.
+%!  ledger_learn(+Key,+Gen,+Value) is semidet.
 %
-%   We received a learn event. Update  our   knowledge  for  Key. If our
-%   knowledge is more recent than the proposer's we try to get our value
-%   accepted.
-%
-%   @tbd Should we also consider the holders?
+%   We received a learn event.
 
-ledger_learn(Key,Gen,Value,Acceptors) :-
-    retractall(paxons_ledger(Key, _Gen, _Value, 0)),
-    clause(paxons_ledger(Key, Gen0, Value0, _Holders), true, Ref),
+ledger_learn(Key,Gen,Value) :-
+    paxons_ledger(Key, Gen0, Value0, _Holders),
     !,
-    (   (   Gen > Gen0
-        ;   Value == Value0
-        )
-    ->  asserta(paxons_ledger(Key, Gen, Value, Acceptors)),
-        erase(Ref)
-    ;   paxos_set(Key, Value0)
+    (   Gen == Gen0,
+        Value == Value0
+    ->  true
+    ;   Gen > Gen0
+    ->  asserta(paxons_ledger(Key, Gen, Value, 0))
     ).
+ledger_learn(Key,Gen,Value) :-
+    asserta(paxons_ledger(Key, Gen, Value, 0)).
 
-ledger_learn(Key,Gen,Value,Acceptors) :-
-    asserta(paxons_ledger(Key, Gen, Value, Acceptors)).
+
+		 /*******************************
+		 *            UTIL		*
+		 *******************************/
+
+%!  bitmap_list(?Bitmap, ?List) is det.
+%
+%   Translate between a bitmap (integer) and a list of integers.
+
+bitmap_list(Bitmap, List) :-
+    integer(Bitmap),
+    !,
+    bitmap_to_list(Bitmap, List).
+bitmap_list(Bitmap, List) :-
+    list_to_bitmap(List, 0, Bitmap).
+
+bitmap_to_list(0, []) :-
+    !.
+bitmap_to_list(N, [H|T]) :-
+    H is lsb(N),
+    N2 is N /\ \(1<<H),
+    bitmap_to_list(N2, T).
+
+list_to_bitmap([], Bitmap, Bitmap).
+list_to_bitmap([H|T], Bitmap0, Bitmap) :-
+    Bitmap1 is Bitmap0 \/ (1<<H),
+    list_to_bitmap(T, Bitmap1, Bitmap).
