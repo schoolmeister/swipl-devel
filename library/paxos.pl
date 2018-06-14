@@ -296,8 +296,6 @@ paxos_set(Key, Value, Options) :-
       paxos_message(changed(Key,K1,Value,AcceptNodes), -, Changed),
       broadcast(Changed),
     !.
-paxos_set(Key, Value, _) :-
-    throw(error(paxos_error(set(Key, Value)), _)).
 
 apply_default(Var, Setting) :-
     var(Var),
