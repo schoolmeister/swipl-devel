@@ -34,16 +34,17 @@
 */
 
 :- module(paxos,
-          [ paxos_get/1,         % ?Term
-            paxos_get/2,         % +Key, -Value
-            paxos_get/3,         % +Key, -Value, +Options
-            paxos_set/1,         % ?Term
-            paxos_set/2,         % +Key, +Value
-            paxos_set/3,         % +Key, +Value, +Options
-            paxos_on_change/2,   % ?Term, +Goal
-            paxos_on_change/3,   % ?Key, ?Value, +Goal
-                                 % Hook support
-            paxos_replicate/2    % +Nodes, +Options
+          [ paxos_get/1,                        % ?Term
+            paxos_get/2,                        % +Key, -Value
+            paxos_get/3,                        % +Key, -Value, +Options
+            paxos_set/1,                        % ?Term
+            paxos_set/2,                        % +Key, +Value
+            paxos_set/3,                        % +Key, +Value, +Options
+            paxos_on_change/2,                  % ?Term, +Goal
+            paxos_on_change/3,                  % ?Key, ?Value, +Goal
+                                                % Hook support
+            paxos_replicate/2,                  % +Nodes, +Options
+            paxos_replicate_count/3             % +Nodes, -Count, +Options
           ]).
 :- use_module(library(broadcast)).
 :- use_module(library(debug)).
@@ -51,6 +52,7 @@
 :- use_module(library(settings)).
 :- use_module(library(option)).
 :- use_module(library(error)).
+:- use_module(library(aggregate)).
 
 /** <module> A Replicated Data Store
 
@@ -198,6 +200,8 @@ paxos_initialize_sync :-
 %     - retrieve(+Key,-Node,-Gen,-Value)
 %     A request message to retrieve our value for Key.  Also provides
 %     our node id and the generation.
+%     - node(-Node)
+%     Get the node id.
 %
 %   @tbd: originally the changed was  handled  by   a  get  and when not
 %   successful with a new set, named   _paxos_audit_. I don't really see
@@ -240,6 +244,8 @@ paxos_message(retrieve(Key,Node,K,Value)) :-
     ledger(Key,K,Value),
     debug(paxos, 'Retrieved ~p-~p@~d', [Key,Value,K]),
     !.
+paxos_message(node(Node)) :-
+    node(Node).
 
 %%  paxos_set(+Term) is semidet.
 %
@@ -275,6 +281,7 @@ paxos_message(retrieve(Key,Node,K,Value)) :-
 %     _setting_ `response_timeout` (0.020, 20ms).
 %
 %   @arg Term is a compound  that   may  have  unbound variables.
+%   @tbd If the Value is already current, should we simply do nothing?
 
 paxos_set(Term) :-
     paxos_key(Term, Key),
@@ -462,7 +469,6 @@ paxos_key(Compound, _) :-
 
 paxos_replicate(Nodes, Options) :-
     option(new(New), Options, true),
-    !,
     option(timeout(TMO), Options, TMO),
     apply_default(TMO, response_timeout),
     bitmap_list(Bitmap, Nodes),
@@ -478,6 +484,24 @@ paxos_replicate(Nodes, Options) :-
         broadcast(Learned),
         fail
     ;   true
+    ).
+
+%!  paxos_replicate_count(+Nodes, -Count, +Options) is det.
+%
+%   Count the number of keys for which we have updates for one of the
+%   members of Nodes.
+
+
+paxos_replicate_count(Nodes, Count, Options) :-
+    option(new(New), Options, true),
+    bitmap_list(Bitmap, Nodes),
+    aggregate_all(count, can_replicate(New, _Key, Bitmap), Count).
+
+can_replicate(New, Key, Bitmap) :-
+    ledger_current(Key, _Gen, _Value, Holders),
+    (   New == false
+    ->  true
+    ;   Bitmap /\ \Holders =\= 0
     ).
 
 %!  paxos_on_change(?Term, :Goal) is det.
