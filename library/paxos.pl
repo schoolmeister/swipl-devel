@@ -485,7 +485,8 @@ replication_key(Nodes, Key) :-
     (   Nth is 1+random(popcount(Nodes))
     ;   Nth = 1
     ),
-    call_nth(needs_replicate(Nodes, Key), Nth).
+    call_nth(needs_replicate(Nodes, Key), Nth),
+    !.
 
 needs_replicate(Nodes, Key) :-
     ledger_current(Key, _Gen, _Value, Holders),
