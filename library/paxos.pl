@@ -43,8 +43,7 @@
             paxos_on_change/2,                  % ?Term, +Goal
             paxos_on_change/3,                  % ?Key, ?Value, +Goal
                                                 % Hook support
-            paxos_replicate/2,                  % +Nodes, +Options
-            paxos_replicate_count/3             % +Nodes, -Count, +Options
+            paxos_replicate_key/3               % +Nodes, ?Key, +Options
           ]).
 :- use_module(library(broadcast)).
 :- use_module(library(debug)).
@@ -52,7 +51,7 @@
 :- use_module(library(settings)).
 :- use_module(library(option)).
 :- use_module(library(error)).
-:- use_module(library(aggregate)).
+:- use_module(library(solution_sequences)).
 
 /** <module> A Replicated Data Store
 
@@ -200,6 +199,8 @@ paxos_initialize_sync :-
 %     - retrieve(+Key,-Node,-Gen,-Value)
 %     A request message to retrieve our value for Key.  Also provides
 %     our node id and the generation.
+%     - forget(+Nodes)
+%     Forget the existence of Nodes.
 %     - node(-Node)
 %     Get the node id.
 %
@@ -244,6 +245,8 @@ paxos_message(retrieve(Key,Node,K,Value)) :-
     ledger(Key,K,Value),
     debug(paxos, 'Retrieved ~p-~p@~d', [Key,Value,K]),
     !.
+paxos_message(forget(Nodes)) :-
+    ledger_forget(Nodes).
 paxos_message(node(Node)) :-
     node(Node).
 
@@ -455,54 +458,38 @@ paxos_key(Compound, '$c'(Name,Arity)) :-
 paxos_key(Compound, _) :-
     must_be(compound, Compound).
 
-%!  paxos_replicate(+Nodes, +Options) is det.
+%!  paxos_replicate_key(+Nodes:bitmap, ?Key, +Options) is det.
 %
-%   Start a replication process, ensuring that  Nodes have an up-to-date
-%   value for all keys.  Options:
+%   Replicate a Key to Nodes.  If Key is unbound, a random key is
+%   selected.
 %
-%     - new(+Bool)
-%     If `true` (default), only send keys we think are not already
-%     known to the Nodes.  Otherwise, send all keys.
 %     - timeout(+Seconds)
 %     Max time to wait for the forum to reply.  Defaults to the
 %     _setting_ `response_timeout` (0.020, 20ms).
 
-paxos_replicate(Nodes, Options) :-
-    option(new(New), Options, true),
+paxos_replicate_key(Nodes, Key, Options) :-
+    replication_key(Nodes, Key),
     option(timeout(TMO), Options, TMO),
     apply_default(TMO, response_timeout),
-    bitmap_list(Bitmap, Nodes),
-    (   ledger_current(Key, Gen, Value, Holders),
-        (   New == false
-        ->  true
-        ;   Bitmap /\ \Holders =\= 0
-        ),
-        paxos_message(learn(Key,Na,Gen,Ga,Value), TMO, Learn),
-        collect(Bitmap, Ga == nack, Na, Ga, Learn, _Gas, LearnedNodes),
-        NewHolders is Holders \/ LearnedNodes,
-        paxos_message(learned(Key,Gen,Value,NewHolders), -, Learned),
-        broadcast(Learned),
-        fail
-    ;   true
-    ).
+    ledger_current(Key, Gen, Value, Holders),
+    paxos_message(learn(Key,Na,Gen,Ga,Value), TMO, Learn),
+    collect(Nodes, Ga == nack, Na, Ga, Learn, _Gas, LearnedNodes),
+    NewHolders is Holders \/ LearnedNodes,
+    paxos_message(learned(Key,Gen,Value,NewHolders), -, Learned),
+    broadcast(Learned).
 
-%!  paxos_replicate_count(+Nodes, -Count, +Options) is det.
-%
-%   Count the number of keys for which we have updates for one of the
-%   members of Nodes.
+replication_key(_Nodes, Key) :-
+    ground(Key),
+    !.
+replication_key(Nodes, Key) :-
+    (   Nth is 1+random(popcount(Nodes))
+    ;   Nth = 1
+    ),
+    call_nth(needs_replicate(Nodes, Key), Nth).
 
-
-paxos_replicate_count(Nodes, Count, Options) :-
-    option(new(New), Options, true),
-    bitmap_list(Bitmap, Nodes),
-    aggregate_all(count, can_replicate(New, _Key, Bitmap), Count).
-
-can_replicate(New, Key, Bitmap) :-
+needs_replicate(Nodes, Key) :-
     ledger_current(Key, _Gen, _Value, Holders),
-    (   New == false
-    ->  true
-    ;   Bitmap /\ \Holders =\= 0
-    ).
+    Nodes /\ \Holders =\= 0.
 
 %!  paxos_on_change(?Term, :Goal) is det.
 %!  paxos_on_change(?Key, ?Value, :Goal) is det.
@@ -654,30 +641,26 @@ ledger_learn(Key,Gen,Value) :-
 ledger_learn(Key,Gen,Value) :-
     asserta(paxons_ledger(Key, Gen, Value, 0)).
 
-
-		 /*******************************
-		 *            UTIL		*
-		 *******************************/
-
-%!  bitmap_list(?Bitmap, ?List) is det.
+%!  ledger_forget(+Nodes) is det.
 %
-%   Translate between a bitmap (integer) and a list of integers.
+%   Remove Nodes from all ledgers.  This is executed in a background
+%   thread.
 
-bitmap_list(Bitmap, List) :-
-    integer(Bitmap),
-    !,
-    bitmap_to_list(Bitmap, List).
-bitmap_list(Bitmap, List) :-
-    list_to_bitmap(List, 0, Bitmap).
+ledger_forget(Nodes) :-
+    thread_create(ledger_forget_threaded(Nodes), _,
+                  [ detached(true)
+                  ]).
 
-bitmap_to_list(0, []) :-
-    !.
-bitmap_to_list(N, [H|T]) :-
-    H is lsb(N),
-    N2 is N /\ \(1<<H),
-    bitmap_to_list(N2, T).
+ledger_forget_threaded(Nodes) :-
+    debug(paxos(node), 'Forgetting 0x~16r', [Nodes]),
+    forall(ledger_current(Key, Gen, _Value, Holders),
+           ledger_forget(Nodes, Key, Gen, Holders)),
+    debug(paxos(node), 'Forgotten 0x~16r', [Nodes]).
 
-list_to_bitmap([], Bitmap, Bitmap).
-list_to_bitmap([H|T], Bitmap0, Bitmap) :-
-    Bitmap1 is Bitmap0 \/ (1<<H),
-    list_to_bitmap(T, Bitmap1, Bitmap).
+ledger_forget(Nodes, Key, Gen, Holders) :-
+    NewHolders is Holders /\ \Nodes,
+    (   NewHolders \== Holders,
+        ledger_update_holders(Key, Gen, NewHolders)
+    ->  true
+    ;   true
+    ).
